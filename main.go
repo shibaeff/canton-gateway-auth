@@ -295,10 +295,15 @@ func (s *server) Check(_ context.Context, req *authv3.CheckRequest) (*authv3.Che
 
 	s.stats.authDecisions.WithLabelValues(s.cfg.Environment, s.cfg.Node, service, protocol, "allow", "mapped_identity").Inc()
 	s.stats.admitted.WithLabelValues(s.cfg.Environment, s.cfg.Node, client, service, protocol).Inc()
+	overwrite := corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD
 	return &authv3.CheckResponse{
 		Status: &status.Status{Code: int32(codes.OK)},
 		HttpResponse: &authv3.CheckResponse_OkResponse{OkResponse: &authv3.OkHttpResponse{
-			Headers:         []*corev3.HeaderValueOption{{Header: &corev3.HeaderValue{Key: clientHeader, Value: client}}},
+			Headers: []*corev3.HeaderValueOption{
+				{Header: &corev3.HeaderValue{Key: clientHeader, Value: client}, AppendAction: overwrite},
+				{Header: &corev3.HeaderValue{Key: serviceHeader, Value: service}, AppendAction: overwrite},
+				{Header: &corev3.HeaderValue{Key: protocolHeader, Value: protocol}, AppendAction: overwrite},
+			},
 			HeadersToRemove: []string{identityHeader},
 		}},
 	}, nil

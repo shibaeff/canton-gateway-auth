@@ -14,8 +14,10 @@ Required configuration:
   `{"canton-ledger-http":{"service":"ledger","protocol":"http"}}`.
 
 The service never logs credentials and rejects any unmapped identity. Envoy
-must overwrite `x-canton-service` and `x-canton-protocol` per route and log only
-the trusted attribution headers to ALS.
+must remove inbound attribution headers before authentication and pass trusted
+route metadata to `ext_authz`. On allow, this service overwrites
+`x-canton-client`, `x-canton-service`, and `x-canton-protocol`; Envoy logs only
+those trusted attribution headers to ALS.
 
 Use `canton_api_admitted_requests_total` for usage-window monitoring because it
 is incremented synchronously in ext_auth. `canton_api_requests_total` and

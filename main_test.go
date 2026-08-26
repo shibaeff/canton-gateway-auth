@@ -58,6 +58,17 @@ func TestCheckMapsJWTIdentityAndOverwritesClientHeader(t *testing.T) {
 	if got := response.GetOkResponse().GetHeaders()[0].GetHeader().GetValue(); got != "openzeppelin" {
 		t.Fatalf("client header = %q", got)
 	}
+	for i, want := range []struct{ key, value string }{
+		{clientHeader, "openzeppelin"}, {serviceHeader, "ledger"}, {protocolHeader, "grpc"},
+	} {
+		header := response.GetOkResponse().GetHeaders()[i]
+		if header.GetHeader().GetKey() != want.key || header.GetHeader().GetValue() != want.value {
+			t.Fatalf("header %d = %s:%s, want %s:%s", i, header.GetHeader().GetKey(), header.GetHeader().GetValue(), want.key, want.value)
+		}
+		if header.GetAppendAction() != corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD {
+			t.Fatalf("header %s does not overwrite an inbound value", want.key)
+		}
+	}
 }
 
 func TestCheckMapsDARKeyAndReloadsRotation(t *testing.T) {
