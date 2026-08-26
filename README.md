@@ -7,7 +7,9 @@ a normalized client name and exports completed request counters and latency.
 Required configuration:
 
 - `AUTH0_CLIENTS_JSON`: JSON map of Auth0 `client_id`/`azp` values to normalized clients.
-- `API_KEYS_FILE`: optional JSON map of DAR API keys to normalized clients.
+- `API_KEYS_FILE`: optional JSON map of DAR API keys to normalized clients. Values may be
+  client strings or DAR proxy entries such as `{"name":"client-1","party":"..."}`; the
+  bounded `name` is used for metrics attribution and the party is ignored.
 - `ENVIRONMENT`, `NODE`: constant metric labels.
 - `ALLOWED_SERVICES`, `ALLOWED_PROTOCOLS`: bounded label allowlists.
 - `ROUTES_JSON`: Envoy Gateway route-name map such as

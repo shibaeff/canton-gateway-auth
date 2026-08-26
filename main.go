@@ -152,6 +152,35 @@ func parseMapping(data []byte, allowEmpty bool) (map[string]string, error) {
 	return result, nil
 }
 
+func parseAPIKeyMapping(data []byte) (map[string]string, error) {
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("must be a JSON object of API key mappings: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("mapping must not be empty")
+	}
+
+	result := make(map[string]string, len(entries))
+	for credential, raw := range entries {
+		var client string
+		if err := json.Unmarshal(raw, &client); err != nil {
+			var entry struct {
+				Name string `json:"name"`
+			}
+			if objectErr := json.Unmarshal(raw, &entry); objectErr != nil {
+				return nil, errors.New("mapping values must be normalized client strings or objects with a normalized name")
+			}
+			client = entry.Name
+		}
+		if strings.TrimSpace(credential) == "" || !normalizedLabel.MatchString(client) {
+			return nil, errors.New("mapping contains an empty credential or invalid normalized client")
+		}
+		result[credential] = client
+	}
+	return result, nil
+}
+
 func (s *identityStore) reloadKeys() error {
 	info, err := os.Stat(s.path)
 	if err != nil {
@@ -167,7 +196,7 @@ func (s *identityStore) reloadKeys() error {
 	if err != nil {
 		return fmt.Errorf("read API_KEYS_FILE: %w", err)
 	}
-	keys, err := parseMapping(data, false)
+	keys, err := parseAPIKeyMapping(data)
 	if err != nil {
 		return fmt.Errorf("API_KEYS_FILE: %w", err)
 	}

@@ -97,6 +97,38 @@ func TestCheckMapsDARKeyAndReloadsRotation(t *testing.T) {
 	}
 }
 
+func TestCheckMapsDARRichAPIKeyEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.json")
+	if err := os.WriteFile(path, []byte(`{
+		"object-secret":{"name":"client-1","party":"client1-demo::1220deadbeef"}
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t, `{}`, path)
+	response, err := s.Check(context.Background(), checkRequest(map[string]string{
+		"authorization": "Bearer object-secret",
+	}, "canton-dar-upload"))
+	if err != nil || response.GetOkResponse() == nil {
+		t.Fatalf("expected rich API key entry to be accepted: response=%v err=%v", response, err)
+	}
+	if got := response.GetOkResponse().GetHeaders()[0].GetHeader().GetValue(); got != "client-1" {
+		t.Fatalf("client header = %q, want client-1", got)
+	}
+}
+
+func TestAPIKeyMappingRejectsObjectWithoutNormalizedName(t *testing.T) {
+	for name, data := range map[string]string{
+		"missing": `{"secret":{"party":"client1-demo::1220deadbeef"}}`,
+		"invalid": `{"secret":{"name":"Client 1","party":"client1-demo::1220deadbeef"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseAPIKeyMapping([]byte(data)); err == nil {
+				t.Fatal("expected invalid rich API key entry to be rejected")
+			}
+		})
+	}
+}
+
 func TestCheckRejectsUnknownAndInvalidMetadata(t *testing.T) {
 	s := testServer(t, `{"known":"openzeppelin"}`, "")
 	for name, headers := range map[string]map[string]string{
