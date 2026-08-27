@@ -50,14 +50,20 @@ func TestAuth0UsageCollectorBootstrapsAndPersistsMetrics(t *testing.T) {
 		switch r.URL.Path {
 		case "/oauth/token":
 			if r.Method != http.MethodPost {
-				t.Fatalf("token method = %s", r.Method)
+				t.Errorf("token method = %s", r.Method)
+				http.Error(w, "wrong method", http.StatusMethodNotAllowed)
+				return
 			}
 			var request map[string]string
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Fatal(err)
+				t.Errorf("decode token request: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
 			}
 			if request["audience"] != server.URL+"/api/v2/" || request["grant_type"] != "client_credentials" {
-				t.Fatalf("unexpected token request: %#v", request)
+				t.Errorf("unexpected token request: %#v", request)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
 			}
 			json.NewEncoder(w).Encode(map[string]any{"access_token": "test-token", "expires_in": 3600})
 		case "/api/v2/logs":
@@ -78,11 +84,14 @@ func TestAuth0UsageCollectorBootstrapsAndPersistsMetrics(t *testing.T) {
 			case "next-checkpoint":
 				json.NewEncoder(w).Encode([]auth0LogEntry{})
 			default:
-				t.Fatalf("unexpected checkpoint: %q", r.URL.Query().Get("from"))
+				t.Errorf("unexpected checkpoint: %q", r.URL.Query().Get("from"))
+				http.Error(w, "bad checkpoint", http.StatusBadRequest)
 			}
 		case "/api/v2/stats/daily":
 			if r.URL.Query().Get("from") == "" || r.URL.Query().Get("to") == "" {
-				t.Fatal("daily stats date range is missing")
+				t.Error("daily stats date range is missing")
+				http.Error(w, "missing date range", http.StatusBadRequest)
+				return
 			}
 			json.NewEncoder(w).Encode([]map[string]any{{
 				"date": "2026-08-26T00:00:00Z", "logins": 11, "signups": 2, "leaked_passwords": 1,
