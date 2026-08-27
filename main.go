@@ -449,6 +449,10 @@ func isGRPCStatus(value string) bool {
 }
 
 func run() error {
+	if envOr("SERVICE_MODE", "gateway") == "auth0-usage-exporter" {
+		return runAuth0UsageExporter()
+	}
+
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
