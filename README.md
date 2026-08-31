@@ -27,6 +27,11 @@ is incremented synchronously in ext_auth. `canton_api_requests_total` and
 gRPC outcome labels; ALS is intentionally lossy and should not be the billing
 source of record.
 
+Admission and authorization counters are initialized at zero for every bounded
+configured client/route combination so idle gateways remain queryable and the
+first scrape can establish the zero baseline used by Prometheus `increase()`
+queries.
+
 ## Auth0 usage exporter mode
 
 Set `SERVICE_MODE=auth0-usage-exporter` to run a metrics-only process that polls
