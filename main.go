@@ -212,6 +212,24 @@ func (s *identityStore) clientForIdentity(identity string) (string, bool) {
 	return client, ok
 }
 
+func (s *identityStore) clients() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	unique := make(map[string]struct{}, len(s.static)+len(s.keys))
+	for _, client := range s.static {
+		unique[client] = struct{}{}
+	}
+	for _, client := range s.keys {
+		unique[client] = struct{}{}
+	}
+	clients := make([]string, 0, len(unique))
+	for client := range unique {
+		clients = append(clients, client)
+	}
+	return clients
+}
+
 func (s *identityStore) clientForAPIKey(key string) (string, bool, error) {
 	if s.path == "" {
 		return "", false, nil
@@ -287,6 +305,23 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	}
 	reg.MustRegister(m.requests, m.admitted, m.duration, m.authDecisions, m.alsDropped, m.gatewayUp)
 	return m
+}
+
+func (m *metrics) initializeIdleSeries(cfg config, clients []string) {
+	routes := make(map[routeMetadata]struct{}, len(cfg.Routes))
+	for _, route := range cfg.Routes {
+		routes[route] = struct{}{}
+	}
+	for route := range routes {
+		for _, client := range clients {
+			m.admitted.WithLabelValues(cfg.Environment, cfg.Node, client, route.Service, route.Protocol)
+		}
+		m.authDecisions.WithLabelValues(cfg.Environment, cfg.Node, route.Service, route.Protocol, "allow", "mapped_identity")
+		m.authDecisions.WithLabelValues(cfg.Environment, cfg.Node, route.Service, route.Protocol, "deny", "unmapped_identity")
+		m.authDecisions.WithLabelValues(cfg.Environment, cfg.Node, route.Service, route.Protocol, "deny", "mapping_unavailable")
+	}
+	m.authDecisions.WithLabelValues(cfg.Environment, cfg.Node, "unknown", "unknown", "deny", "invalid_request")
+	m.authDecisions.WithLabelValues(cfg.Environment, cfg.Node, "unknown", "unknown", "deny", "invalid_metadata")
 }
 
 type server struct {
@@ -463,6 +498,7 @@ func run() error {
 	}
 	registry := prometheus.NewRegistry()
 	s := &server{cfg: cfg, ids: ids, stats: newMetrics(registry)}
+	s.stats.initializeIdleSeries(cfg, ids.clients())
 	up := s.stats.gatewayUp.WithLabelValues(cfg.Environment, cfg.Node)
 	up.Set(1)
 

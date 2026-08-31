@@ -33,7 +33,9 @@ func testServer(t *testing.T, staticJSON, keyFile string) *server {
 			"canton-dar-upload":  {Service: "dar", Protocol: "http"},
 		},
 	}
-	return &server{cfg: cfg, ids: ids, stats: newMetrics(prometheus.NewRegistry())}
+	stats := newMetrics(prometheus.NewRegistry())
+	stats.initializeIdleSeries(cfg, ids.clients())
+	return &server{cfg: cfg, ids: ids, stats: stats}
 }
 
 func checkRequest(headers map[string]string, route string) *authv3.CheckRequest {
@@ -47,6 +49,33 @@ func checkRequest(headers map[string]string, route string) *authv3.CheckRequest 
 	}}
 }
 
+func TestInitializeIdleSeriesExportsZeroCounters(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	m := newMetrics(registry)
+	cfg := config{
+		Environment: "dev1",
+		Node:        "validator-dev1",
+		Routes: map[string]routeMetadata{
+			"canton-ledger-http": {Service: "ledger", Protocol: "http"},
+			"canton-dar-upload":  {Service: "dar", Protocol: "http"},
+			"canton-dar-list":    {Service: "dar", Protocol: "http"},
+		},
+	}
+
+	m.initializeIdleSeries(cfg, []string{"client-1", "openzeppelin", "client-1"})
+	m.initializeIdleSeries(cfg, []string{"client-1", "openzeppelin"})
+
+	if got := testutil.CollectAndCount(m.admitted); got != 4 {
+		t.Fatalf("admitted metric count = %d, want 4", got)
+	}
+	if got := testutil.ToFloat64(m.admitted.WithLabelValues("dev1", "validator-dev1", "client-1", "dar", "http")); got != 0 {
+		t.Fatalf("idle admitted metric = %v, want 0", got)
+	}
+	if got := testutil.CollectAndCount(m.authDecisions); got != 8 {
+		t.Fatalf("authorization metric count = %d, want 8", got)
+	}
+}
+
 func TestCheckMapsJWTIdentityAndOverwritesClientHeader(t *testing.T) {
 	s := testServer(t, `{"auth0-id":"openzeppelin"}`, "")
 	response, err := s.Check(context.Background(), checkRequest(map[string]string{
@@ -57,6 +86,9 @@ func TestCheckMapsJWTIdentityAndOverwritesClientHeader(t *testing.T) {
 	}
 	if got := response.GetOkResponse().GetHeaders()[0].GetHeader().GetValue(); got != "openzeppelin" {
 		t.Fatalf("client header = %q", got)
+	}
+	if got := testutil.ToFloat64(s.stats.admitted.WithLabelValues("dev1", "validator-dev1", "openzeppelin", "ledger", "grpc")); got != 1 {
+		t.Fatalf("admitted metric = %v, want first request to increment zero-initialized counter to 1", got)
 	}
 	for i, want := range []struct{ key, value string }{
 		{clientHeader, "openzeppelin"}, {serviceHeader, "ledger"}, {protocolHeader, "grpc"},
