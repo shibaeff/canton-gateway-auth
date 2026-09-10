@@ -38,8 +38,21 @@ func TestCheckpointFromLink(t *testing.T) {
 	}
 }
 
+func TestNormalizeAuth0ClientLabel(t *testing.T) {
+	for input, want := range map[string]string{
+		"Canton Indexer (dev1)": "canton-indexer-dev1",
+		"  M2M / Reader  ":      "m2m-reader",
+		"---":                   "client",
+	} {
+		if got := normalizeAuth0ClientLabel(input); got != want {
+			t.Fatalf("normalizeAuth0ClientLabel(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestAuth0UsageCollectorBootstrapsAndPersistsMetrics(t *testing.T) {
 	var logRequests int
+	var clientRequests int
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/oauth/token" && r.Header.Get("Authorization") != "Bearer test-token" {
@@ -80,6 +93,7 @@ func TestAuth0UsageCollectorBootstrapsAndPersistsMetrics(t *testing.T) {
 					{LogID: "log-1", Type: auth0SuccessClientCredentials, ClientID: "known-id"},
 					{LogID: "log-2", Type: auth0FailedClientCredentials, ClientID: "unknown-id"},
 					{LogID: "log-3", Type: "s", ClientID: "known-id"},
+					{LogID: "log-4", Type: auth0SuccessClientCredentials, ClientID: "indexer-id"},
 				})
 			case "next-checkpoint":
 				json.NewEncoder(w).Encode([]auth0LogEntry{})
@@ -87,6 +101,21 @@ func TestAuth0UsageCollectorBootstrapsAndPersistsMetrics(t *testing.T) {
 				t.Errorf("unexpected checkpoint: %q", r.URL.Query().Get("from"))
 				http.Error(w, "bad checkpoint", http.StatusBadRequest)
 			}
+		case "/api/v2/clients":
+			clientRequests++
+			if r.URL.Query().Get("app_type") != "non_interactive" || r.URL.Query().Get("include_totals") != "true" {
+				t.Errorf("unexpected client inventory query: %s", r.URL.RawQuery)
+				http.Error(w, "bad query", http.StatusBadRequest)
+				return
+			}
+			json.NewEncoder(w).Encode(auth0ClientsPage{
+				Clients: []auth0Client{
+					{ClientID: "known-id", Name: "Ignored static name", AppType: "non_interactive"},
+					{ClientID: "indexer-id", Name: "Canton Indexer (dev1)", AppType: "non_interactive", ClientMetadata: map[string]string{"workload": "canton-indexer"}},
+					{ClientID: "idle-id", Name: "Idle M2M", AppType: "non_interactive"},
+				},
+				Total: 3, Start: 0, Limit: 100,
+			})
 		case "/api/v2/stats/daily":
 			if r.URL.Query().Get("from") == "" || r.URL.Query().Get("to") == "" {
 				t.Error("daily stats date range is missing")
@@ -129,6 +158,21 @@ func TestAuth0UsageCollectorBootstrapsAndPersistsMetrics(t *testing.T) {
 	if got := testutil.ToFloat64(collector.metrics.m2m.WithLabelValues("dev1", "validator-dev1", "other", "failure")); got != 1 {
 		t.Fatalf("other failed exchanges = %v", got)
 	}
+	if got := testutil.ToFloat64(collector.metrics.m2mClients.WithLabelValues("dev1", "validator-dev1", "openzeppelin")); got != 1 {
+		t.Fatalf("configured client inventory = %v", got)
+	}
+	if got := testutil.ToFloat64(collector.metrics.m2mClients.WithLabelValues("dev1", "validator-dev1", "canton-indexer")); got != 1 {
+		t.Fatalf("discovered client inventory = %v", got)
+	}
+	if got := testutil.ToFloat64(collector.metrics.m2m.WithLabelValues("dev1", "validator-dev1", "canton-indexer", "success")); got != 1 {
+		t.Fatalf("discovered client exchanges = %v", got)
+	}
+	if got := testutil.ToFloat64(collector.metrics.m2mClients.WithLabelValues("dev1", "validator-dev1", "idle-m2m")); got != 1 {
+		t.Fatalf("idle client inventory = %v", got)
+	}
+	if got := testutil.ToFloat64(collector.metrics.m2m.WithLabelValues("dev1", "validator-dev1", "idle-m2m", "success")); got != 0 {
+		t.Fatalf("idle client exchanges = %v", got)
+	}
 	if got := testutil.ToFloat64(collector.metrics.daily.WithLabelValues("dev1", "validator-dev1", "2026-08-26", "logins")); got != 11 {
 		t.Fatalf("daily logins = %v", got)
 	}
@@ -140,6 +184,9 @@ func TestAuth0UsageCollectorBootstrapsAndPersistsMetrics(t *testing.T) {
 	}
 	if logRequests != 2 {
 		t.Fatalf("log requests = %d, want 2", logRequests)
+	}
+	if clientRequests != 2 {
+		t.Fatalf("client inventory requests = %d, want 2", clientRequests)
 	}
 
 	restarted, err := newAuth0UsageCollector(cfg, server.Client(), prometheus.NewRegistry())
