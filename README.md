@@ -43,9 +43,12 @@ Required configuration:
 
 - `AUTH0_DOMAIN`: tenant hostname, without an API path.
 - `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET`: read-only Management API client with
-  `read:logs` and `read:stats` grants.
-- `AUTH0_USAGE_CLIENTS_JSON`: optional map of Auth0 client IDs to bounded client
-  labels. Unmapped M2M exchanges are aggregated as `client="other"`.
+  `read:clients`, `read:logs`, and `read:stats` grants.
+- `AUTH0_USAGE_CLIENTS_JSON`: optional overrides from Auth0 client IDs to bounded
+  client labels. The exporter discovers all `non_interactive` applications and
+  prefers their `client_metadata.workload` value, then their normalized Auth0
+  application name. Exchanges from clients absent from the latest inventory are
+  aggregated as `client="other"`.
 - `AUTH0_USAGE_STATE_FILE`: durable log checkpoint and counter state; defaults
   to `/data/auth0-usage-state.json`.
 - `AUTH0_USAGE_POLL_INTERVAL`: defaults to `5m` and cannot be less than `30s`.
@@ -56,6 +59,8 @@ Required configuration:
 The exporter emits:
 
 - `auth0_m2m_token_exchanges_total` from `seccft` and `feccft` tenant logs.
+- `auth0_m2m_client_info` for every `non_interactive` application returned by
+  the Auth0 client inventory, including clients with no observed exchanges.
 - `auth0_tenant_daily_events` for logins, signups, and breached-password
   detections. Auth0 daily stats do not count M2M exchanges.
 - `auth0_tenant_active_users` for the Auth0 30-day active-user statistic.

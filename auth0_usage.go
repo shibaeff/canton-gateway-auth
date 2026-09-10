@@ -117,6 +117,7 @@ type auth0UsageState struct {
 
 type auth0UsageMetrics struct {
 	m2m             *prometheus.CounterVec
+	m2mClients      *prometheus.GaugeVec
 	daily           *prometheus.GaugeVec
 	activeUsers     *prometheus.GaugeVec
 	collectorUp     *prometheus.GaugeVec
@@ -132,6 +133,10 @@ func newAuth0UsageMetrics(reg prometheus.Registerer) *auth0UsageMetrics {
 			Name: "auth0_m2m_token_exchanges_total",
 			Help: "Auth0 client-credentials exchanges consumed from tenant logs.",
 		}, []string{"environment", "node", "client", "outcome"}),
+		m2mClients: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "auth0_m2m_client_info",
+			Help: "Auth0 non-interactive applications discovered from the tenant client inventory.",
+		}, []string{"environment", "node", "client"}),
 		daily: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "auth0_tenant_daily_events",
 			Help: "Auth0 tenant daily statistics. These do not include M2M token exchanges.",
@@ -161,18 +166,19 @@ func newAuth0UsageMetrics(reg prometheus.Registerer) *auth0UsageMetrics {
 			Help: "Whether the exporter has established a durable Auth0 log checkpoint.",
 		}),
 	}
-	reg.MustRegister(m.m2m, m.daily, m.activeUsers, m.collectorUp, m.lastSuccess, m.errors, m.logsProcessed, m.checkpointReady)
+	reg.MustRegister(m.m2m, m.m2mClients, m.daily, m.activeUsers, m.collectorUp, m.lastSuccess, m.errors, m.logsProcessed, m.checkpointReady)
 	return m
 }
 
 type auth0UsageCollector struct {
-	cfg        auth0UsageConfig
-	httpClient *http.Client
-	metrics    *auth0UsageMetrics
-	state      auth0UsageState
-	tokenMu    sync.Mutex
-	token      string
-	tokenUntil time.Time
+	cfg         auth0UsageConfig
+	httpClient  *http.Client
+	metrics     *auth0UsageMetrics
+	state       auth0UsageState
+	clientNames map[string]string
+	tokenMu     sync.Mutex
+	token       string
+	tokenUntil  time.Time
 }
 
 func newAuth0UsageCollector(cfg auth0UsageConfig, client *http.Client, reg prometheus.Registerer) (*auth0UsageCollector, error) {
@@ -183,7 +189,13 @@ func newAuth0UsageCollector(cfg auth0UsageConfig, client *http.Client, reg prome
 	if client == nil {
 		client = &http.Client{Timeout: 20 * time.Second}
 	}
-	c := &auth0UsageCollector{cfg: cfg, httpClient: client, metrics: newAuth0UsageMetrics(reg), state: state}
+	clientNames := make(map[string]string, len(cfg.ClientNames))
+	for clientID, clientName := range cfg.ClientNames {
+		clientNames[clientID] = clientName
+	}
+	c := &auth0UsageCollector{
+		cfg: cfg, httpClient: client, metrics: newAuth0UsageMetrics(reg), state: state, clientNames: clientNames,
+	}
 	for clientName, outcomes := range state.M2M {
 		if clientName != "other" && !normalizedLabel.MatchString(clientName) {
 			return nil, fmt.Errorf("state contains invalid client label %q", clientName)
@@ -195,10 +207,7 @@ func newAuth0UsageCollector(cfg auth0UsageConfig, client *http.Client, reg prome
 			c.metrics.m2m.WithLabelValues(cfg.Environment, cfg.Node, clientName, outcome).Add(float64(count))
 		}
 	}
-	for _, clientName := range cfg.ClientNames {
-		c.metrics.m2m.WithLabelValues(cfg.Environment, cfg.Node, clientName, "success").Add(0)
-		c.metrics.m2m.WithLabelValues(cfg.Environment, cfg.Node, clientName, "failure").Add(0)
-	}
+	c.updateClientInventory(clientNames)
 	if state.Checkpoint != "" {
 		c.metrics.checkpointReady.Set(1)
 	}
@@ -279,6 +288,10 @@ func (c *auth0UsageCollector) collect(ctx context.Context) {
 		return
 	}
 	failed := false
+	if err := c.collectClients(ctx, token); err != nil {
+		c.collectionFailed("clients", err)
+		failed = true
+	}
 	if err := c.collectLogs(ctx, token); err != nil {
 		c.collectionFailed("logs", err)
 		failed = true
@@ -347,6 +360,113 @@ type auth0LogEntry struct {
 	ClientID string `json:"client_id"`
 }
 
+type auth0Client struct {
+	ClientID       string            `json:"client_id"`
+	Name           string            `json:"name"`
+	AppType        string            `json:"app_type"`
+	ClientMetadata map[string]string `json:"client_metadata"`
+}
+
+type auth0ClientsPage struct {
+	Clients []auth0Client `json:"clients"`
+	Total   int           `json:"total"`
+	Start   int           `json:"start"`
+	Limit   int           `json:"limit"`
+}
+
+func (c *auth0UsageCollector) collectClients(ctx context.Context, token string) error {
+	clientNames := make(map[string]string, len(c.cfg.ClientNames))
+	usedLabels := make(map[string]string, len(c.cfg.ClientNames))
+	for clientID, clientName := range c.cfg.ClientNames {
+		clientNames[clientID] = clientName
+		usedLabels[clientName] = clientID
+	}
+
+	const perPage = 100
+	for page := 0; ; page++ {
+		endpoint, err := url.Parse(c.cfg.BaseURL + "/api/v2/clients")
+		if err != nil {
+			return err
+		}
+		query := endpoint.Query()
+		query.Set("app_type", "non_interactive")
+		query.Set("fields", "client_id,name,app_type,client_metadata")
+		query.Set("include_fields", "true")
+		query.Set("include_totals", "true")
+		query.Set("page", strconv.Itoa(page))
+		query.Set("per_page", strconv.Itoa(perPage))
+		endpoint.RawQuery = query.Encode()
+
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		var response auth0ClientsPage
+		if _, err := c.doJSON(request, &response); err != nil {
+			return err
+		}
+
+		for _, client := range response.Clients {
+			if client.ClientID == "" || client.AppType != "non_interactive" {
+				continue
+			}
+			if _, configured := clientNames[client.ClientID]; configured {
+				continue
+			}
+			label := client.ClientMetadata["workload"]
+			if !normalizedLabel.MatchString(label) {
+				label = normalizeAuth0ClientLabel(client.Name)
+			}
+			if existingID, duplicate := usedLabels[label]; duplicate && existingID != client.ClientID {
+				label = normalizeAuth0ClientLabel("client-" + client.ClientID)
+			}
+			clientNames[client.ClientID] = label
+			usedLabels[label] = client.ClientID
+		}
+
+		if len(response.Clients) < perPage || (response.Total > 0 && (page+1)*perPage >= response.Total) {
+			break
+		}
+	}
+
+	c.clientNames = clientNames
+	c.updateClientInventory(clientNames)
+	return nil
+}
+
+func normalizeAuth0ClientLabel(value string) string {
+	var label strings.Builder
+	separator := false
+	for _, char := range strings.ToLower(strings.TrimSpace(value)) {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') {
+			if separator && label.Len() > 0 && label.Len() < 63 {
+				label.WriteByte('-')
+			}
+			separator = false
+			if label.Len() < 63 {
+				label.WriteRune(char)
+			}
+			continue
+		}
+		separator = true
+	}
+	result := strings.TrimRight(label.String(), "-")
+	if result == "" {
+		return "client"
+	}
+	return result
+}
+
+func (c *auth0UsageCollector) updateClientInventory(clientNames map[string]string) {
+	c.metrics.m2mClients.Reset()
+	for _, clientName := range clientNames {
+		c.metrics.m2mClients.WithLabelValues(c.cfg.Environment, c.cfg.Node, clientName).Set(1)
+		c.metrics.m2m.WithLabelValues(c.cfg.Environment, c.cfg.Node, clientName, "success").Add(0)
+		c.metrics.m2m.WithLabelValues(c.cfg.Environment, c.cfg.Node, clientName, "failure").Add(0)
+	}
+}
+
 func (c *auth0UsageCollector) collectLogs(ctx context.Context, token string) error {
 	if c.state.Checkpoint == "" {
 		checkpoint, err := c.latestLogCheckpoint(ctx, token)
@@ -410,7 +530,7 @@ func (c *auth0UsageCollector) collectLogs(ctx context.Context, token string) err
 			default:
 				continue
 			}
-			clientName := c.cfg.ClientNames[entry.ClientID]
+			clientName := c.clientNames[entry.ClientID]
 			if clientName == "" {
 				clientName = "other"
 			}
