@@ -73,3 +73,19 @@ counts new log events from that point. It does not silently reinterpret the
 tenant's retained log tail as a historical backfill. Daily statistics are
 refreshed from Auth0 on every poll. HTTP 429 and other API failures are exposed
 as collection errors without affecting gateway authorization.
+
+Client discovery must succeed before a poll consumes logs. If discovery fails,
+the exporter keeps its existing inventory and durable checkpoint, reports the
+collector down, and still attempts tenant statistics. This prevents exchanges
+for newly separated clients from being permanently attributed to `other` while
+their inventory is unavailable. Repair discovery before Auth0's log retention
+window expires; a delayed first successful startup still establishes a fresh
+forward-only checkpoint, not a backfill.
+
+Inventory HTTP 401/403 errors invalidate the cached Management API token for
+the next scheduled poll, allowing a repaired grant to take effect without
+waiting for token expiry or restarting. There is no immediate retry loop;
+429 and 5xx failures retain the cached token. The `read:clients` grant is still
+required: token refresh cannot add permissions that the client does not have.
+Previously persisted `other` counts cannot be reassigned from aggregate state.
+Do not reset the checkpoint to try to recover them.

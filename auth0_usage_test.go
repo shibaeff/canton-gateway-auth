@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,5 +227,114 @@ func TestCheckpointURLIsOpaque(t *testing.T) {
 	header := "<https://tenant.eu.auth0.com/api/v2/logs?" + url.Values{"from": {checkpoint}, "take": {"100"}}.Encode() + ">; rel=\"next\""
 	if got := checkpointFromLink(header); got != checkpoint {
 		t.Fatalf("checkpointFromLink() = %q, want %q", got, checkpoint)
+	}
+}
+
+func TestClientDiscoveryFailurePreservesAttribution(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		status      int
+		wantRefresh bool
+	}{
+		{"unauthorized", http.StatusUnauthorized, true},
+		{"forbidden", http.StatusForbidden, true},
+		{"rate-limited", http.StatusTooManyRequests, false},
+		{"server-error", http.StatusInternalServerError, false},
+	} {
+		for _, checkpoint := range []string{"", "before"} {
+			t.Run(tc.name+"/checkpoint="+checkpoint, func(t *testing.T) {
+				var recovered atomic.Bool
+				var tokenRequests, logRequests atomic.Int64
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					switch r.URL.Path {
+					case "/oauth/token":
+						tokenRequests.Add(1)
+						json.NewEncoder(w).Encode(map[string]any{"access_token": "test-token", "expires_in": 86400})
+					case "/api/v2/clients":
+						if !recovered.Load() {
+							http.Error(w, "inventory unavailable", tc.status)
+							return
+						}
+						json.NewEncoder(w).Encode(auth0ClientsPage{Clients: []auth0Client{{
+							ClientID: "new-dar-client", Name: "DAR proxy", AppType: "non_interactive",
+							ClientMetadata: map[string]string{"workload": "dar-upload-proxy"},
+						}}, Total: 1})
+					case "/api/v2/logs":
+						logRequests.Add(1)
+						if r.URL.Query().Get("per_page") == "1" {
+							json.NewEncoder(w).Encode([]auth0LogEntry{{LogID: "before"}})
+						} else if r.URL.Query().Get("from") == "before" {
+							json.NewEncoder(w).Encode([]auth0LogEntry{{LogID: "after", Type: auth0SuccessClientCredentials, ClientID: "new-dar-client"}})
+						} else {
+							json.NewEncoder(w).Encode([]auth0LogEntry{})
+						}
+					case "/api/v2/stats/daily":
+						json.NewEncoder(w).Encode([]auth0DailyStats{})
+					case "/api/v2/stats/active-users":
+						json.NewEncoder(w).Encode(0)
+					default:
+						http.NotFound(w, r)
+					}
+				}))
+				defer server.Close()
+				cfg := auth0UsageConfig{
+					Environment: "dev1", Node: "validator-dev1", BaseURL: server.URL,
+					ClientID: "reader", ClientSecret: "secret", StateFile: filepath.Join(t.TempDir(), "state.json"),
+					PollInterval: time.Minute, DailyLookback: 31, MaxLogPages: 10,
+				}
+				if checkpoint != "" {
+					if err := writeAuth0UsageState(cfg.StateFile, auth0UsageState{Checkpoint: checkpoint,
+						M2M: map[string]map[string]uint64{"other": {"success": 7}}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				collector, err := newAuth0UsageCollector(cfg, server.Client(), prometheus.NewRegistry())
+				if err != nil {
+					t.Fatal(err)
+				}
+				collector.collect(context.Background())
+				if logRequests.Load() != 0 {
+					t.Fatal("consumed logs without a successful client inventory")
+				}
+				state, err := loadAuth0UsageState(cfg.StateFile)
+				if err != nil || state.Checkpoint != checkpoint {
+					t.Fatalf("checkpoint changed on discovery failure: %+v, %v", state, err)
+				}
+				if got := testutil.ToFloat64(collector.metrics.collectorUp.WithLabelValues("dev1", "validator-dev1")); got != 0 {
+					t.Fatalf("collector health during failure = %v", got)
+				}
+				recovered.Store(true)
+				collector.collect(context.Background())
+				if checkpoint == "" {
+					collector.collect(context.Background()) // First successful poll only bootstraps.
+				}
+				collector.collect(context.Background()) // No duplicate count on the next poll.
+				wantTokens := int64(1)
+				if tc.wantRefresh {
+					wantTokens = 2
+				}
+				if tokenRequests.Load() != wantTokens {
+					t.Fatalf("token requests = %d, want %d", tokenRequests.Load(), wantTokens)
+				}
+				if got := testutil.ToFloat64(collector.metrics.m2m.WithLabelValues("dev1", "validator-dev1", "dar-upload-proxy", "success")); got != 1 {
+					t.Fatalf("dedicated client exchanges = %v, want 1", got)
+				}
+				if got := testutil.ToFloat64(collector.metrics.collectorUp.WithLabelValues("dev1", "validator-dev1")); got != 1 {
+					t.Fatalf("collector health after recovery = %v", got)
+				}
+				state, err = loadAuth0UsageState(cfg.StateFile)
+				if err != nil || state.Checkpoint != "after" || state.M2M["dar-upload-proxy"]["success"] != 1 {
+					t.Fatalf("unexpected durable state after recovery: %+v, %v", state, err)
+				}
+				wantOther := uint64(0)
+				if checkpoint != "" {
+					wantOther = 7
+				}
+				if state.M2M["other"]["success"] != wantOther {
+					t.Fatal("recovery changed existing unattributed counts")
+				}
+			})
+		}
 	}
 }

@@ -291,8 +291,18 @@ func (c *auth0UsageCollector) collect(ctx context.Context) {
 	if err := c.collectClients(ctx, token); err != nil {
 		c.collectionFailed("clients", err)
 		failed = true
-	}
-	if err := c.collectLogs(ctx, token); err != nil {
+		// Do not advance the durable log checkpoint with an incomplete inventory:
+		// a newly created client's exchanges would otherwise be lost into "other".
+		// A cached token keeps its old scopes after a grant is repaired. Invalidate
+		// it only for authorization failures; retry at the next scheduled poll.
+		var apiErr *auth0APIError
+		if errors.As(err, &apiErr) && (apiErr.statusCode == http.StatusUnauthorized || apiErr.statusCode == http.StatusForbidden) {
+			c.tokenMu.Lock()
+			c.token = ""
+			c.tokenUntil = time.Time{}
+			c.tokenMu.Unlock()
+		}
+	} else if err := c.collectLogs(ctx, token); err != nil {
 		c.collectionFailed("logs", err)
 		failed = true
 	}
@@ -667,6 +677,13 @@ func (c *auth0UsageCollector) collectStats(ctx context.Context, token string) er
 	return nil
 }
 
+type auth0APIError struct {
+	statusCode int
+	message    string
+}
+
+func (e *auth0APIError) Error() string { return e.message }
+
 func (c *auth0UsageCollector) doJSON(request *http.Request, output any) (http.Header, error) {
 	response, err := c.httpClient.Do(request)
 	if err != nil {
@@ -675,7 +692,10 @@ func (c *auth0UsageCollector) doJSON(request *http.Request, output any) (http.He
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return response.Header, fmt.Errorf("Auth0 %s %s returned %s: %s", request.Method, request.URL.Path, response.Status, strings.TrimSpace(string(body)))
+		return response.Header, &auth0APIError{
+			statusCode: response.StatusCode,
+			message:    fmt.Sprintf("Auth0 %s %s returned %s: %s", request.Method, request.URL.Path, response.Status, strings.TrimSpace(string(body))),
+		}
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(output); err != nil {
 		return response.Header, fmt.Errorf("decode Auth0 %s: %w", request.URL.Path, err)
