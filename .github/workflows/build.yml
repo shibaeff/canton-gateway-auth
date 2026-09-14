@@ -38,7 +38,7 @@ jobs:
           images: ghcr.io/shibaeff/canton-gateway-auth
           tags: |
             type=sha,format=long
-            type=raw,value=latest
+            type=raw,value=latest,enable={{is_default_branch}}
       - uses: docker/build-push-action@v7
         with:
           context: .
